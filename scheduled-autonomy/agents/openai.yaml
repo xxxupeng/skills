@@ -1,0 +1,4 @@
+interface:
+  display_name: "定时目标推进"
+  short_description: "在原会话持久化目标并定时自主推进，长任务等待期间不调用模型"
+  default_prompt: "使用 $scheduled-autonomy，在我明确授权的目标、资源和时间预算内持续推进，等待长任务时安排后台唤醒并结束推理。"
