@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import uuid
+from cli_backend import CLI
 
 STOPPED = {'paused', 'cancelled', 'completed', 'expired', 'waiting_user'}
 
@@ -55,7 +56,7 @@ class Store:
         return json.loads(self.path.read_text())
 
     def initialize(self, *, objective, criteria, authorization, cwd, socket_path,
-                   deadline, min_interval=3600, now=None):
+                   deadline, min_interval=3600, now=None, transport=None):
         now = time.time() if now is None else now
         if not all(str(x).strip() for x in (objective, criteria, authorization)):
             raise ValueError('objective, criteria and authorization required')
@@ -70,6 +71,8 @@ class Store:
                      created_at=now, deadline=deadline, min_interval=min_interval,
                      status='active', progress='', next_action='', pending=None,
                      last_delivery=None, revisions=[], updated_at=now)
+            if transport:
+                s.update(transport)
 
     def progress(self, progress, next_action, now=None):
         with self.edit() as s:
@@ -118,11 +121,12 @@ class Store:
 
 
 class RPC:
+    backend = 'app-server'
     def __init__(self, path):
-        import websocket  # websocket-client; never install automatically
         st = os.stat(path)
         if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
             raise ValueError('not a current-user Unix socket')
+        import websocket  # websocket-client; only needed for an existing socket
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(15)
         try:
@@ -188,6 +192,22 @@ class RPC:
         self.ws.close()
 
 
+def open_peer(state, log_dir):
+    """Select before any send. Legacy goals remain server-only; never fail over mid-send."""
+    backend = state.get('backend', 'app-server')
+    if backend not in ('auto', 'app-server', 'cli'):
+        raise ValueError('unknown backend')
+    if backend != 'cli':
+        try:
+            return RPC(state['socket'])
+        except (FileNotFoundError, ConnectionRefusedError):
+            if backend != 'auto':
+                raise
+    if state.get('selected_at_init') == 'app-server' and not state.get('cli_identity'):
+        raise ValueError('CLI fallback not bound at init; keep app-server ownership')
+    return CLI(state, log_dir)
+
+
 def halt(s, reason, now, status='waiting_user'):
     s.update(status=status, reason=reason, pending=None, updated_at=now)
     return reason
@@ -219,7 +239,9 @@ def record_completion(store, turn_id, result, now=None):
             return
         d.update(status=result['status'], observed_at=now, error=result.get('error'))
         # Do not overwrite a new wake or a deliberate completion/cancellation.
-        if not s['pending'] and s['status'] not in STOPPED:
+        if result['status'] != 'completed' and s['status'] not in STOPPED:
+            halt(s, 'turn_' + result['status'], now)
+        elif not s['pending'] and s['status'] not in STOPPED:
             halt(s, 'turn_finished_without_next_wake' if result['status'] == 'completed'
                  else 'turn_' + result['status'], now)
 
@@ -289,7 +311,9 @@ def tick(store, peer, now):
             s['last_delivery'] = {'at': now, 'token': p['token'], 'status': 'unknown', 'error': str(e)}
             return halt(s, 'unknown', now)
         s.update(last_delivery={'at': now, 'token': p['token'], 'status': 'accepted',
-                                'turn_id': turn['id']}, pending=None, status='active', updated_at=now)
+                                'turn_id': turn['id'], 'backend': getattr(peer, 'backend', 'app-server'),
+                                **{k: turn[k] for k in ('pid', 'events', 'stderr') if k in turn}},
+                 pending=None, status='active', updated_at=now)
         return 'accepted'
 
 
@@ -311,6 +335,7 @@ def ensure_worker(store):
     subprocess.run(['systemctl', '--user', 'reset-failed', unit], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL)
     subprocess.run(['systemd-run', '--user', '--collect', '--unit=' + unit,
+                    '--property=KillMode=process',
                     '--setenv=CODEX_THREAD_ID=' + store.thread,
                     sys.executable, str(Path(__file__).resolve()), '--root', str(store.folder.parent),
                     '--thread', store.thread, 'worker'], check=True)
@@ -338,7 +363,7 @@ def worker(store):
                 time.sleep(min(60, max(1, (p['next_attempt'] if p else s['deadline']) - now)))
                 continue
             try:
-                peer = RPC(s['socket'])
+                peer = open_peer(s, store.folder / 'deliveries')
                 try:
                     outcome = tick(store, peer, time.time())
                     if outcome == 'accepted':
@@ -401,6 +426,8 @@ def cli():
     a.add_argument('--deadline', type=timestamp, required=True)
     a.add_argument('--min-interval', type=int, default=3600, help='seconds; use project floor and estimated total/10')
     a.add_argument('--socket', default=str(home / 'app-server-control/app-server-control.sock'))
+    a.add_argument('--backend', choices=['auto', 'app-server', 'cli'], default='auto')
+    a.add_argument('--codex-binary', default='codex', help='CLI executable, resolved at init')
     a.add_argument('--native-goal-inactive', action='store_true', required=True, help='acknowledge native goal checked inactive')
     sub.add_parser('status'); sub.add_parser('probe'); sub.add_parser('worker')
     a = sub.add_parser('progress'); a.add_argument('--summary', required=True); a.add_argument('--next-action', required=True)
@@ -418,20 +445,40 @@ def cli():
         p.error('explicit thread conflicts with current CODEX_THREAD_ID')
     store = Store(args.root, args.thread)
     if args.cmd == 'init':
-        peer = RPC(args.socket)
+        import shutil
+        transport = dict(backend=args.backend, codex_home=str(home.expanduser().resolve()),
+                         codex_binary=shutil.which(args.codex_binary) or args.codex_binary)
+        candidate = dict(transport, thread_id=store.thread, socket=args.socket,
+                         cwd=str(Path.cwd().resolve()), host=socket.gethostname())
+        peer = open_peer(candidate, store.folder / 'deliveries')
         try:
             t = peer.read(store.thread)
             if t['id'] != store.thread or str(Path(t['cwd']).resolve()) != str(Path.cwd().resolve()):
                 raise ValueError('thread/project identity mismatch')
+            transport['selected_at_init'] = getattr(peer, 'backend', 'app-server')
+            if isinstance(peer, CLI):
+                transport['cli_identity'] = peer.identity
+            elif args.backend == 'auto':
+                try:
+                    local = CLI(candidate, store.folder / 'deliveries')
+                    transport['cli_identity'] = local.identity
+                    local.close()
+                except (ValueError, OSError):
+                    # Desktop/dynamic-tool sessions retain their actual owner.
+                    pass
         finally:
             peer.close()
         store.initialize(objective=args.objective, criteria=args.criteria, authorization=args.authorization,
-                         cwd=Path.cwd(), socket_path=args.socket, deadline=args.deadline, min_interval=args.min_interval)
+                         cwd=Path.cwd(), socket_path=args.socket, deadline=args.deadline,
+                         min_interval=args.min_interval, transport=transport)
     elif args.cmd == 'probe':
-        s = store.read(); peer = RPC(s['socket'])
+        s = store.read(); peer = open_peer(s, store.folder / 'deliveries')
         try:
             t = peer.read(store.thread)
-            print(json.dumps({'id': t['id'], 'cwd': t['cwd'], 'status': t['status']}))
+            if t['id'] != store.thread or str(Path(t['cwd']).resolve()) != s['cwd'] or s['host'] != socket.gethostname():
+                raise ValueError('thread/host/cwd identity mismatch')
+            print(json.dumps({'id': t['id'], 'cwd': t['cwd'], 'status': t['status'],
+                              'backend': getattr(peer, 'backend', 'app-server')}))
         finally:
             peer.close()
         return

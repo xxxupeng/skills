@@ -8,6 +8,7 @@ import threading
 import subprocess
 import os
 import sys
+sys.path.insert(0, str(Path(__file__).parents[1] / 'scripts'))
 
 SPEC = importlib.util.spec_from_file_location('scheduler', Path(__file__).parents[1] / 'scripts' / 'scheduler.py')
 m = importlib.util.module_from_spec(SPEC)

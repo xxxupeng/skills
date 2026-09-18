@@ -46,15 +46,24 @@ description: Use when a user requests goal-driven autonomous work across long-ru
 ## 运行
 
 先读 [references/operations.md](references/operations.md)，执行脚本 `--help`。
-`scripts/scheduler.py` 使用当前 `CODEX_THREAD_ID`、当前宿主的用户 socket，并核对项目路径；没有 ID 时不能用 `--last` 猜。
-目前后端为 Linux + systemd 用户服务 + Python3/websocket-client；其他系统先报告后端未适配，不声称普遍可运行。
-初次启动先 probe；优先复用现有受支持接口，不启动新 app-server，不用独立 `codex exec resume` 操作同一任务。
+`scripts/scheduler.py` 使用当前 `CODEX_THREAD_ID`，核对宿主和项目路径；没有 ID 时不能用 `--last` 猜。
+目前支持 Linux + systemd 用户服务 + Python3；app-server 后端另需 websocket-client，CLI 后端需已登录的 Codex CLI。
+新目标默认 `--backend auto`：优先现有 app-server；socket不存在/明确拒绝连接时，自动使用经身份核对的本地 CLI 会话。
+CLI 使用 `codex exec resume <明确UUID>`，不创建新任务；锁定原 cwd、CODEX_HOME、模型、权限和配置指纹。
+纯 CLI 不需要启动 app-server。两种方式沿用同一目标、计时器和至多一次投递规则；也可显式指定 `app-server` / `cli`。
+已有旧目标没有 backend 字段时仍为 app-server，不因升级自动切换或恢复；其他系统未适配。
+
+初次启动先 probe。CLI 交互终端须在唤醒前退出/释放会话；检测到未完成轮次或 Codex 仍持有 rollout 时延后，
+不能同时用交互终端与后台 exec 操作同一任务。CLI 只接受已保存 `approval_policy=never` 的 CLI/exec 会话；
+不自动放宽沙盒或跳过审批。带桌面动态工具的会话保持 app-server，不因连接失败静默转成工具不兼容的 CLI。
+身份不明、权限/配置变化或发送结果不明时停止自动投递；不得自行换后端重发。具体边界见 operations。
 
 唤醒 prompt 写清：检查哪个任务/证据，正常未完成如何等待，完成如何分析和推进，异常如何处置，以及授权与停止条件。
 后台消息是先前授权的调度，不是新用户授权。未来轮次必须读本 Skill 和目标文件。
 
-`schedule` 成功只说明后台调度已安排；`accepted` 是服务接受，不等于任务完成。查投递记录/实际回复再报告唤醒成功。
-`notLoaded` 是可恢复状态：核对ID/宿主/cwd后通过当前服务 `thread/resume` 加载同一会话并订阅事件，不创建新会话。
+`schedule` 成功只说明后台调度已安排；app-server 的 `accepted` 是服务接受，CLI 的 `accepted` 仅表示子进程已启动，
+都不等于任务完成。查投递记录/实际回复再报告唤醒成功。
+app-server 的 `notLoaded` 是可恢复状态：核对ID/宿主/cwd后通过当前服务 `thread/resume` 加载同一会话并订阅事件，不创建新会话。
 保留原始会话状态；非忙碌的临时错误也有界重试。投递后保持连接观察 `turn/completed`，最多30分钟/截止时间。
 本轮必须安排后继或显式结束/暂停目标；完成却没有后继会标记待核对，不能让active空转到截止。
 无需在每轮显示固定模板；有新安排时简述时间和目的即可。失败需说明，不能承诺自动恢复。
@@ -66,4 +75,6 @@ description: Use when a user requests goal-driven autonomous work across long-ru
 失败保存 `ALERT.json`、journal与状态，尝试本机notify-send；这不是可靠的跨SSH桌面通知，`submitted`也不是阅读回执。
 后台无法连接服务且没有可用通知通道时，无法保证主动告知用户；启用时必须披露，不承诺无人值守故障必达。
 idle 检查与 turn/start 不是原子接口，极短竞态仍可能与用户消息相遇；不会主动 steer/interrupt。
+CLI 的本地占用检查也不是全产品会话锁：投递期间不要从另一终端手动打开相同任务；无法核实占用时拒绝发送。
+CLI JSONL须含匹配的 thread.started、turn.completed 且进程退出0才算完成；超时/输出不全记为未确认，不杀正在运行的轮次。
 预算到期禁止新投递，但不会强行中断已经开始的模型轮次。轮次开始和启动新实验前都重新检查截止时间。
